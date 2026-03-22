@@ -10,7 +10,7 @@
  *
  * Authors: Cacodemon345, mourix
  *
- *          Copyright 2024 Cacodemon345
+ *          Copyright 2026 Cacodemon345
  */
 
 /* Reference: https://www.touchwindow.com/mm5/drivers/mtsctlrm.pdf */
@@ -23,8 +23,6 @@
     - Add UV/NM commands.
     - Add Calibrate Raw/Interactive.
     - Finish up Calibrate New implementation.
-    - Figure out if Mode Point and Mode DU apply to format Tablet.
-    - Refactor mtouch_prepare_transmit tree to remove duplicate code.
 */
 #include <ctype.h>
 #include <stdint.h>
@@ -47,10 +45,13 @@
 #define NVR_SIZE    16
 
 enum mtouch_formats {
-    FORMAT_DEC    = 1,
-    FORMAT_HEX    = 2,
-    FORMAT_RAW    = 3,
-    FORMAT_TABLET = 4
+    FORMAT_BIN        = 1,
+    FORMAT_BIN_STREAM = 2,
+    FORMAT_DEC        = 3,
+    FORMAT_HEX        = 4,
+    FORMAT_RAW        = 5,
+    FORMAT_TABLET     = 6,
+    FORMAT_ZONE       = 7,
 };
 
 enum mtouch_modes {
@@ -58,6 +59,13 @@ enum mtouch_modes {
     MODE_INACTIVE = 2,
     MODE_POINT    = 3,
     MODE_STREAM   = 4,
+};
+
+enum mtouch_touch_states {
+    TOUCH_NONE    = 0,
+    TOUCH_DOWN    = 1,
+    TOUCH_CONT    = 2,
+    TOUCH_LIFTOFF = 3,
 };
 
 static const char *mtouch_identity[] = {
@@ -88,10 +96,10 @@ typedef struct mouse_microtouch_t {
 static mouse_microtouch_t *mtouch_inst = NULL;
 
 static void
-mtouch_savenvr(void *priv)
+mtouch_nvr_save(void *priv)
 {
     mouse_microtouch_t *dev = (mouse_microtouch_t *) priv;
-    
+
     FILE *fp;
 
     fp = nvr_fopen(dev->nvr_path, "wb");
@@ -103,10 +111,10 @@ mtouch_savenvr(void *priv)
 }
 
 static void
-mtouch_writenvr(void *priv, float scale_x, float scale_y, float off_x, float off_y)
+mtouch_nvr_write(void *priv, float scale_x, float scale_y, float off_x, float off_y)
 {
     mouse_microtouch_t *dev = (mouse_microtouch_t *) priv;
-    
+
     memcpy(&dev->nvr[0], &scale_x, 4);
     memcpy(&dev->nvr[4], &scale_y, 4);
     memcpy(&dev->nvr[8], &off_x, 4);
@@ -114,59 +122,51 @@ mtouch_writenvr(void *priv, float scale_x, float scale_y, float off_x, float off
 }
 
 static void
-mtouch_readnvr(void *priv)
+mtouch_nvr_read(void *priv)
 {
     mouse_microtouch_t *dev = (mouse_microtouch_t *) priv;
+
     memcpy(&dev->scale_x, &dev->nvr[0], 4);
     memcpy(&dev->scale_y, &dev->nvr[4], 4);
     memcpy(&dev->off_x, &dev->nvr[8], 4);
     memcpy(&dev->off_y, &dev->nvr[12], 4);
-    
+
     pclog("MT NVR CAL: scale_x=%f, scale_y=%f, off_x=%f, off_y=%f\n", dev->scale_x, dev->scale_y, dev->off_x, dev->off_y);
 }
 
 static void
-mtouch_initnvr(void *priv)
+mtouch_nvr_init(void *priv)
 {
     mouse_microtouch_t *dev = (mouse_microtouch_t *) priv;
     FILE *fp;
 
-    /* Allocate and initialize the EEPROM. */
+    /* Allocate and initialize the EEPROM */
     dev->nvr = (uint8_t *) calloc(1, NVR_SIZE);
 
     fp = nvr_fopen(dev->nvr_path, "rb");
     if (fp) {
         if (fread(dev->nvr, 1, NVR_SIZE, fp) != NVR_SIZE)
-            fatal("mtouch_initnvr(): Error reading data\n");
+            fatal("mtouch_nvr_init(): Error reading data\n");
         fclose(fp);
         fp = NULL;
     } else
-        mtouch_writenvr(dev, 1, 1, 0, 0);
+        mtouch_nvr_write(dev, 1, 1, 0, 0);
 }
 
+/* Process calibration touch point */
 static void
-mtouch_reset_complete(void *priv)
+mtouch_calibrate(void *priv)
 {
     mouse_microtouch_t *dev = (mouse_microtouch_t *) priv;
-    
-    dev->reset = true;
-    dev->in_reset = false;
-    fifo8_push_all(&dev->resp, (uint8_t *) "\x01\x30\x0D", 3); /* <SOH>0<CR> */
-}
 
-static void
-mtouch_calibrate_timer(void *priv)
-{
-    mouse_microtouch_t *dev = (mouse_microtouch_t *) priv;
-    
-    if ((dev->cal_cntr == 2 && (dev->abs_x > 0.25 || dev->abs_y < 0.75)) || 
+    if ((dev->cal_cntr == 2 && (dev->abs_x > 0.25 || dev->abs_y < 0.75)) ||
         (dev->cal_cntr == 1 && (dev->abs_x < 0.75 || dev->abs_y > 0.25))) {
         return;
     }
-    
+
     dev->cal_cntr--;
     fifo8_push_all(&dev->resp, (uint8_t *) "\x01\x31\x0D", 3); /* <SOH>1<CR> */
-    
+
     if (dev->cal_ex) {
         if (!dev->cal_cntr) {
             double x1_ref = 0.125;
@@ -177,29 +177,156 @@ mtouch_calibrate_timer(void *priv)
             double y1 = dev->abs_y_old;
             double x2 = dev->abs_x;
             double y2 = dev->abs_y;
-            
+
             dev->scale_x = (x2_ref - x1_ref) / (x2 - x1);
             dev->off_x   = x1_ref - dev->scale_x * x1;
             dev->scale_y = (y2_ref - y1_ref) / (y2 - y1);
             dev->off_y   = y1_ref - dev->scale_y * y1;
             dev->cal_ex = false;
-            
+
             pclog("MT NEW CAL: scale_x=%f, scale_y=%f, off_x=%f, off_y=%f\n", dev->scale_x, dev->scale_y, dev->off_x, dev->off_y);
-            mtouch_writenvr(dev, dev->scale_x, dev->scale_y, dev->off_x, dev->off_y);
-            mtouch_savenvr(dev);
+            mtouch_nvr_write(dev, dev->scale_x, dev->scale_y, dev->off_x, dev->off_y);
+            mtouch_nvr_save(dev);
         }
         dev->abs_x_old = dev->abs_x;
         dev->abs_y_old = dev->abs_y;
     }
 }
 
+/* Transmit Format Tablet packet */
 static void
-mtouch_process_commands(mouse_microtouch_t *dev)
+mtouch_transmit_tablet(mouse_microtouch_t *dev, uint8_t touch_state)
+{
+    uint8_t  status;
+    uint16_t tx, ty;
+    double   x, y;
+
+    /* CONT only reports in Stream, LIFTOFF not in Point, NONE never */
+    if ((touch_state == TOUCH_CONT && dev->mode != MODE_STREAM) ||
+        (touch_state == TOUCH_LIFTOFF && dev->mode == MODE_POINT) ||
+        (touch_state == TOUCH_NONE))
+        return;
+    
+    if (touch_state == TOUCH_LIFTOFF) {
+        x = dev->abs_x_old;
+        y = dev->abs_y_old;
+    } else {
+        x = dev->abs_x;
+        y = dev->abs_y;
+    }
+
+    /* Bit 7 always set, bit 6 = touching, bit 5 = pen, bits 0-1 = buttons */
+    status = 0x80 | ((touch_state != TOUCH_LIFTOFF) ? 0x40 : 0x00);
+    if (dev->pen_mode == 2)
+        status |= 0x20 | ((touch_state != TOUCH_LIFTOFF) ? (dev->but & 3) : 0);
+
+    tx = (uint16_t)(16383.0 * x);
+    ty = (uint16_t)(16383.0 * (1.0 - y));
+
+    fifo8_push(&dev->resp, status);
+    fifo8_push(&dev->resp, tx & 0x7F);
+    fifo8_push(&dev->resp, (tx >> 7) & 0x7F);
+    fifo8_push(&dev->resp, ty & 0x7F);
+    fifo8_push(&dev->resp, (ty >> 7) & 0x7F);
+}
+
+/* Transmit Format Decimal or Format Hexadecimal packet */
+static void
+mtouch_transmit_dec_hex(mouse_microtouch_t *dev, uint8_t touch_state)
+{
+    char        buffer[16];
+    const char  *fmt = (dev->format == FORMAT_DEC) ? "%03d,%03d\r" : "%03X,%03X\r";
+    uint16_t    c_max = (dev->format == FORMAT_DEC) ? 999 : 1023;
+    uint8_t     status;
+    double      x, y;
+
+    /* CONT only reports in Stream, LIFTOFF not in Point, NONE never */
+    if ((touch_state == TOUCH_CONT && dev->mode != MODE_STREAM) ||
+        (touch_state == TOUCH_LIFTOFF && dev->mode == MODE_POINT) ||
+        (touch_state == TOUCH_NONE))
+        return;
+
+    if (touch_state == TOUCH_LIFTOFF) {
+        x = dev->abs_x_old;
+        y = dev->abs_y_old;
+    } else {
+        x = dev->abs_x;
+        y = dev->abs_y;
+    }
+
+    if (!dev->mode_status)
+        status = 0x01;
+    else if (touch_state == TOUCH_DOWN)
+        status = 0x19;
+    else if (touch_state == TOUCH_CONT)
+        status = 0x1c;
+    else
+        status = 0x18;
+
+    fifo8_push(&dev->resp, status);
+    snprintf(buffer, sizeof(buffer), fmt, (uint16_t)(c_max * x), (uint16_t)(c_max * (1.0 - y)));
+    fifo8_push_all(&dev->resp, (uint8_t *) buffer, strlen(buffer));
+}
+
+/* Determine touch state and drive transmissions */
+static int
+mtouch_handle_touch(void *priv)
+{
+    mouse_microtouch_t *dev = (mouse_microtouch_t *) priv;
+
+    uint8_t touch_state;
+
+    /* Touch state */
+    if (dev->but && !dev->but_old)
+        touch_state = TOUCH_DOWN;
+    else if (dev->but && dev->but_old)
+        touch_state = TOUCH_CONT;
+    else if (!dev->but && dev->but_old)
+        touch_state = TOUCH_LIFTOFF;
+    else
+        touch_state = TOUCH_NONE;
+
+    if (dev->mode == MODE_INACTIVE)
+        return 0;
+
+    /* Calibration or no buttonpress */
+    if (dev->cal_cntr || touch_state == TOUCH_NONE) {
+        if (touch_state == TOUCH_LIFTOFF)
+            mtouch_calibrate(dev);
+        dev->but_old = dev->but; /* Save buttonpress */
+        return 0;
+    }
+
+    /* Transmission handlers */
+    switch (dev->format) {
+        case FORMAT_TABLET:
+            mtouch_transmit_tablet(dev, touch_state);
+            break;
+        case FORMAT_DEC: case FORMAT_HEX:
+            mtouch_transmit_dec_hex(dev, touch_state);
+            break;
+        case FORMAT_BIN: case FORMAT_BIN_STREAM: case FORMAT_RAW: case FORMAT_ZONE:
+            pclog("MT: unsupported format %d\n", dev->format);
+            break;
+        default:
+            break;
+    }
+
+    /* Save old states */
+    dev->abs_x_old = dev->abs_x;
+    dev->abs_y_old = dev->abs_y;
+    dev->but_old = dev->but;
+    return 0;
+}
+
+/* Parse and execute firmware command */
+static void
+mtouch_process_command(mouse_microtouch_t *dev)
 {
     dev->cmd[strcspn(dev->cmd, "\r")] = '\0';
     pclog("MT Command: %s\n", dev->cmd);
-    
-    if (dev->cmd[0] == 'C' && dev->cmd[1] == 'N') {      /* Calibrate New */
+
+    if (dev->cmd[0] == 'C' && dev->cmd[1] == 'N') { /* Calibrate New */
         dev->cal_cntr = 2;
     }
     else if (dev->cmd[0] == 'C' && dev->cmd[1] == 'X') { /* Calibrate Extended */
@@ -210,16 +337,25 @@ mtouch_process_commands(mouse_microtouch_t *dev)
         dev->cal_ex = true;
         dev->cal_cntr = 2;
     }
+    else if (dev->cmd[0] == 'F' && dev->cmd[1] == 'B') {
+        if (dev->cmd[2] == 'S') { /* Format Binary Stream */
+            dev->format = FORMAT_BIN_STREAM;
+            dev->mode_status = true;
+        } else { /* Format Binary */
+            dev->format = FORMAT_BIN;
+            dev->mode_status = true;
+        }
+    }
     else if (dev->cmd[0] == 'F' && dev->cmd[1] == 'D') { /* Format Decimal */
         dev->format = FORMAT_DEC;
         dev->mode_status = false;
     }
-    else if (dev->cmd[0] == 'F' && dev->cmd[1] == 'O') { /* Finger Only */
-        dev->pen_mode = 1;
-    }
     else if (dev->cmd[0] == 'F' && dev->cmd[1] == 'H') { /* Format Hexadecimal */
         dev->format = FORMAT_HEX;
         dev->mode_status = false;
+    }
+    else if (dev->cmd[0] == 'F' && dev->cmd[1] == 'O') { /* Finger Only */
+        dev->pen_mode = 1;
     }
     else if (dev->cmd[0] == 'F' && dev->cmd[1] == 'R') { /* Format Raw */
         dev->format = FORMAT_RAW;
@@ -228,6 +364,10 @@ mtouch_process_commands(mouse_microtouch_t *dev)
     }
     else if (dev->cmd[0] == 'F' && dev->cmd[1] == 'T') { /* Format Tablet */
         dev->format = FORMAT_TABLET;
+    }
+    else if (dev->cmd[0] == 'F' && dev->cmd[1] == 'Z') { /* Format Zone */
+        dev->format = FORMAT_ZONE;
+        dev->mode = MODE_STREAM;
     }
     else if (dev->cmd[0] == 'G' && dev->cmd[1] == 'P' && dev->cmd[2] == '1') { /* Get Parameter Block 1 */
         fifo8_push_all(&dev->resp, (uint8_t *) "\x01\x41\x0D", 3); /* <SOH>A<CR> */
@@ -262,18 +402,18 @@ mtouch_process_commands(mouse_microtouch_t *dev)
         }
         return;
     }
-    else if (dev->cmd[0] == 'P') { 
+    else if (dev->cmd[0] == 'P') {
         if (strlen(dev->cmd) == 2) { /* Pen */
             if (dev->cmd[1] == 'F') dev->pen_mode = 3;      /* Pen or Finger */
             else if (dev->cmd[1] == 'O') dev->pen_mode = 2; /* Pen Only */
-        } 
+        }
         else if (strlen(dev->cmd) == 5) { /* Serial Options */
             if      (dev->cmd[4] == '1') dev->baud_rate = 19200;
             else if (dev->cmd[4] == '2') dev->baud_rate = 9600;
             else if (dev->cmd[4] == '3') dev->baud_rate = 4800;
             else if (dev->cmd[4] == '4') dev->baud_rate = 2400;
             else if (dev->cmd[4] == '5') dev->baud_rate = 1200;
-            
+
             timer_stop(&dev->host_to_serial_timer);
             timer_on_auto(&dev->host_to_serial_timer, (1000000. / dev->baud_rate) * 10);
         }
@@ -282,18 +422,18 @@ mtouch_process_commands(mouse_microtouch_t *dev)
         dev->in_reset = true;
         dev->cal_cntr = 0;
         dev->pen_mode = 3;
-        
+
         if (dev->cmd[1] == 'D') { /* Restore Defaults */
             dev->mode = MODE_STREAM;
             dev->mode_status = false;
-            
+
             if (dev->id < 2) {
                 dev->format = FORMAT_DEC;
             } else {
                 dev->format = FORMAT_TABLET;
             }
         }
-        
+
         timer_on_auto(&dev->reset_timer, 500. * 1000.);
         return;
     }
@@ -303,7 +443,7 @@ mtouch_process_commands(mouse_microtouch_t *dev)
     }
     else if (dev->cmd[0] == 'U' && dev->cmd[1] == 'T') { /* Unit Type */
         fifo8_push(&dev->resp, 0x01);
-        
+
         if (dev->id == 2) {
             fifo8_push_all(&dev->resp, (uint8_t *) "TP****00", 8);
         } else {
@@ -312,15 +452,16 @@ mtouch_process_commands(mouse_microtouch_t *dev)
         fifo8_push(&dev->resp, 0x0D);
         return;
     }
-    
+
     fifo8_push_all(&dev->resp, (uint8_t *) "\x01\x30\x0D", 3); /* <SOH>0<CR>  */
 }
 
+/* Handle byte received from the host */
 static void
 mtouch_write(UNUSED(serial_t *serial), void *priv, uint8_t data)
 {
     mouse_microtouch_t *dev = (mouse_microtouch_t *) priv;
-    
+
     if (data == '\x1') {
         dev->soh = true;
     }
@@ -331,104 +472,24 @@ mtouch_write(UNUSED(serial_t *serial), void *priv, uint8_t data)
             }
         } else {
             dev->soh = false;
-            
+
             if (!dev->cmd_pos) {
                 return;
             }
-            
+
             dev->cmd[dev->cmd_pos++] = data;
             dev->cmd_pos = 0;
-            mtouch_process_commands(dev);
+            mtouch_process_command(dev);
         }
     }
 }
 
-static int
-mtouch_prepare_transmit(void *priv)
-{
-    mouse_microtouch_t *dev = (mouse_microtouch_t *) priv;
-    
-    char buffer[16];
-    double abs_x = dev->abs_x;
-    double abs_y = dev->abs_y;
-    int but      = dev->but;
-    
-    if (dev->mode == MODE_INACTIVE) {
-        return 0;
-    }
-    
-    if (dev->cal_cntr || (!dev->but && !dev->but_old)) { /* Calibration or no buttonpress */
-        if (!dev->but && dev->but_old) {
-            mtouch_calibrate_timer(dev);
-        }
-        dev->but_old = but; /* Save buttonpress */
-        return 0;
-    }
-    
-    if (dev->format == FORMAT_TABLET) {
-        if (but) { /* Touchdown/Continuation */
-            fifo8_push(&dev->resp, 0b11000000 | ((dev->pen_mode == 2) ? ((1 << 5) | ((but & 3))) : 0));
-            fifo8_push(&dev->resp, (uint16_t)(16383 * abs_x) & 0b1111111);
-            fifo8_push(&dev->resp, ((uint16_t)(16383 * abs_x) >> 7) & 0b1111111);
-            fifo8_push(&dev->resp, (uint16_t)(16383 * (1 - abs_y)) & 0b1111111);
-            fifo8_push(&dev->resp, ((uint16_t)(16383 * (1 - abs_y)) >> 7) & 0b1111111);
-        } 
-        else if (dev->but_old) { /* Liftoff */
-            fifo8_push(&dev->resp, 0b10000000 | ((dev->pen_mode == 2) ? ((1 << 5)) : 0));
-            fifo8_push(&dev->resp, (uint16_t)(16383 * dev->abs_x_old) & 0b1111111);
-            fifo8_push(&dev->resp, ((uint16_t)(16383 * dev->abs_x_old) >> 7) & 0b1111111);
-            fifo8_push(&dev->resp, (uint16_t)(16383 * (1 - dev->abs_y_old)) & 0b1111111);
-            fifo8_push(&dev->resp, ((uint16_t)(16383 * (1 - dev->abs_y_old)) >> 7) & 0b1111111);
-        }
-    }
-    
-    else if (dev->format == FORMAT_DEC || dev->format == FORMAT_HEX) {
-        if (but) {
-            if (!dev->but_old) { /* Touchdown (MS, MP, MDU) */
-                fifo8_push(&dev->resp, (dev->mode_status) ? 0x19 : 0x01);
-                if (dev->format == FORMAT_DEC) {
-                    snprintf(buffer, sizeof(buffer), "%03d,%03d\r", (uint16_t)(999 * abs_x), (uint16_t)(999 * (1 - abs_y)));
-                }
-                else if (dev->format == FORMAT_HEX) {
-                    snprintf(buffer, sizeof(buffer), "%03X,%03X\r", (uint16_t)(1023 * abs_x), (uint16_t)(1023 * (1 - abs_y)));
-                }
-                fifo8_push_all(&dev->resp, (uint8_t *)buffer, strlen(buffer));
-            }
-            else if (dev->mode == MODE_STREAM) { /* Touch Continuation (MS) */
-                fifo8_push(&dev->resp, (dev->mode_status) ? 0x1c : 0x01);
-                if (dev->format == FORMAT_DEC) {
-                    snprintf(buffer, sizeof(buffer), "%03d,%03d\r", (uint16_t)(999 * abs_x), (uint16_t)(999 * (1 - abs_y)));
-                }
-                else if (dev->format == FORMAT_HEX) {
-                    snprintf(buffer, sizeof(buffer), "%03X,%03X\r", (uint16_t)(1023 * abs_x), (uint16_t)(1023 * (1 - abs_y)));
-                }
-                fifo8_push_all(&dev->resp, (uint8_t *)buffer, strlen(buffer));
-            }
-        }
-        else if (dev->but_old && dev->mode != MODE_POINT) { /* Touch Liftoff (MS, MDU) */
-            fifo8_push(&dev->resp, (dev->mode_status) ? 0x18 : 0x01);
-            if (dev->format == FORMAT_DEC) {
-                snprintf(buffer, sizeof(buffer), "%03d,%03d\r", (uint16_t)(999 * dev->abs_x_old), (uint16_t)(999 * (1 - dev->abs_y_old)));
-            }
-            else if (dev->format == FORMAT_HEX) {
-                snprintf(buffer, sizeof(buffer), "%03X,%03X\r", (uint16_t)(1023 * dev->abs_x_old), (uint16_t)(1023 * (1 - dev->abs_y_old)));
-            }
-            fifo8_push_all(&dev->resp, (uint8_t *)buffer, strlen(buffer));
-        }
-    }
-    
-    /* Save old states */
-    dev->abs_x_old = abs_x;
-    dev->abs_y_old = abs_y;
-    dev->but_old = but;
-    return 0;
-}
-
+/* Send next byte to the host */
 static void
 mtouch_write_to_host(void *priv)
 {
     mouse_microtouch_t *dev = (mouse_microtouch_t *) priv;
-    
+
     if (dev->serial == NULL)
         goto no_write_to_machine;
     if ((dev->serial->type >= SERIAL_16550) && dev->serial->fifo_enabled) {
@@ -447,27 +508,29 @@ mtouch_write_to_host(void *priv)
         serial_write_fifo(dev->serial, fifo8_pop(&dev->resp));
     }
     else {
-        mtouch_prepare_transmit(dev);
+        mtouch_handle_touch(dev);
     }
 
 no_write_to_machine:
     timer_on_auto(&dev->host_to_serial_timer, (1000000.0 / (double) dev->baud_rate) * (double) (1 + 8 + 1));
 }
 
+/* Poll absolute coordinates and button state */
 static int
 mtouch_poll(void *priv)
 {
     mouse_microtouch_t *dev = (mouse_microtouch_t *) priv;
-    
+
     dev->but = mouse_get_buttons_ex();
     mouse_get_abs_coords(&dev->abs_x, &dev->abs_y);
-    
+
+    /* Adjust coordinates for overscan */
     if (enable_overscan && mouse_tablet_in_proximity > 0) {
         int index = mouse_tablet_in_proximity - 1;
-        
+
         dev->abs_x *= monitors[index].mon_unscaled_size_x - 1;
         dev->abs_y *= monitors[index].mon_efscrnsz_y - 1;
-        
+
         if (dev->abs_x <= (monitors[index].mon_overscan_x / 2.)) {
             dev->abs_x = (monitors[index].mon_overscan_x / 2.);
         }
@@ -479,15 +542,15 @@ mtouch_poll(void *priv)
         dev->abs_x = dev->abs_x / (double) monitors[index].mon_xsize;
         dev->abs_y = dev->abs_y / (double) monitors[index].mon_ysize;
     }
-    
+
     dev->abs_x = dev->scale_x * dev->abs_x + dev->off_x;
     dev->abs_y = dev->scale_y * dev->abs_y + dev->off_y;
-    
+
     if (dev->abs_x >= 1.0) dev->abs_x = 1.0;
     if (dev->abs_y >= 1.0) dev->abs_y = 1.0;
     if (dev->abs_x <= 0.0) dev->abs_x = 0.0;
     if (dev->abs_y <= 0.0) dev->abs_y = 0.0;
-    
+
     return 0;
 }
 
@@ -497,17 +560,27 @@ mtouch_poll_global(void)
     mtouch_poll(mtouch_inst);
 }
 
+static void
+mtouch_reset_complete(void *priv)
+{
+    mouse_microtouch_t *dev = (mouse_microtouch_t *) priv;
+
+    dev->reset = true;
+    dev->in_reset = false;
+    fifo8_push_all(&dev->resp, (uint8_t *) "\x01\x30\x0D", 3); /* <SOH>0<CR> */
+}
+
 void *
 mtouch_init(UNUSED(const device_t *info))
 {
     mouse_microtouch_t *dev = calloc(1, sizeof(mouse_microtouch_t));
-    
+
     dev->serial = serial_attach(device_get_config_int("port"), NULL, mtouch_write, dev);
     dev->baud_rate = 9600;
     serial_set_cts(dev->serial, 1);
     serial_set_dsr(dev->serial, 1);
     serial_set_dcd(dev->serial, 1);
-    
+
     fifo8_create(&dev->resp, 256);
     timer_add(&dev->host_to_serial_timer, mtouch_write_to_host, dev, 0);
     timer_add(&dev->reset_timer, mtouch_reset_complete, dev, 0);
@@ -515,23 +588,23 @@ mtouch_init(UNUSED(const device_t *info))
     dev->id          = device_get_config_int("identity");
     dev->pen_mode    = 3;
     dev->mode        = MODE_STREAM;
-    
+
     snprintf(dev->nvr_path, sizeof(dev->nvr_path), "mtouch_%s.nvr", mtouch_identity[dev->id]);
-    mtouch_initnvr(dev);
-    mtouch_readnvr(dev);
-    
+    mtouch_nvr_init(dev);
+    mtouch_nvr_read(dev);
+
     if (dev->id < 2) { /* legacy controllers */
         dev->format = FORMAT_DEC;
     } else {
         dev->format = FORMAT_TABLET;
     }
-    
+
     mouse_input_mode = device_get_config_int("crosshair") + 1;
     mouse_set_buttons(2);
     mouse_set_poll(mtouch_poll, dev);
     mouse_set_poll_ex(mtouch_poll_global);
     mtouch_inst = dev;
-    
+
     return dev;
 }
 
@@ -539,16 +612,16 @@ void
 mtouch_close(void *priv)
 {
     mouse_microtouch_t *dev = (mouse_microtouch_t *) priv;
-    
+
     fifo8_destroy(&dev->resp);
-    /* Detach serial port from the mouse. */
+    /* Detach serial port from the mouse */
     if (dev && dev->serial && dev->serial->sd) {
         memset(dev->serial->sd, 0, sizeof(serial_device_t));
     }
-    
+
     if (dev->nvr != NULL)
         free(dev->nvr);
-    
+
     free(dev);
     mtouch_inst = NULL;
 }
