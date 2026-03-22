@@ -96,10 +96,8 @@ typedef struct mouse_microtouch_t {
 static mouse_microtouch_t *mtouch_inst = NULL;
 
 static void
-mtouch_nvr_save(void *priv)
+mtouch_nvr_save(mouse_microtouch_t *dev)
 {
-    mouse_microtouch_t *dev = (mouse_microtouch_t *) priv;
-
     FILE *fp;
 
     fp = nvr_fopen(dev->nvr_path, "wb");
@@ -111,10 +109,8 @@ mtouch_nvr_save(void *priv)
 }
 
 static void
-mtouch_nvr_write(void *priv, float scale_x, float scale_y, float off_x, float off_y)
+mtouch_nvr_write(mouse_microtouch_t *dev, float scale_x, float scale_y, float off_x, float off_y)
 {
-    mouse_microtouch_t *dev = (mouse_microtouch_t *) priv;
-
     memcpy(&dev->nvr[0], &scale_x, 4);
     memcpy(&dev->nvr[4], &scale_y, 4);
     memcpy(&dev->nvr[8], &off_x, 4);
@@ -122,10 +118,8 @@ mtouch_nvr_write(void *priv, float scale_x, float scale_y, float off_x, float of
 }
 
 static void
-mtouch_nvr_read(void *priv)
+mtouch_nvr_read(mouse_microtouch_t *dev)
 {
-    mouse_microtouch_t *dev = (mouse_microtouch_t *) priv;
-
     memcpy(&dev->scale_x, &dev->nvr[0], 4);
     memcpy(&dev->scale_y, &dev->nvr[4], 4);
     memcpy(&dev->off_x, &dev->nvr[8], 4);
@@ -135,9 +129,8 @@ mtouch_nvr_read(void *priv)
 }
 
 static void
-mtouch_nvr_init(void *priv)
+mtouch_nvr_init(mouse_microtouch_t *dev)
 {
-    mouse_microtouch_t *dev = (mouse_microtouch_t *) priv;
     FILE *fp;
 
     /* Allocate and initialize the EEPROM */
@@ -155,10 +148,8 @@ mtouch_nvr_init(void *priv)
 
 /* Process calibration touch point */
 static void
-mtouch_calibrate(void *priv)
+mtouch_calibrate(mouse_microtouch_t *dev)
 {
-    mouse_microtouch_t *dev = (mouse_microtouch_t *) priv;
-
     if ((dev->cal_cntr == 2 && (dev->abs_x > 0.25 || dev->abs_y < 0.75)) ||
         (dev->cal_cntr == 1 && (dev->abs_x < 0.75 || dev->abs_y > 0.25))) {
         return;
@@ -270,10 +261,8 @@ mtouch_transmit_dec_hex(mouse_microtouch_t *dev, uint8_t touch_state)
 
 /* Determine touch state and drive transmissions */
 static int
-mtouch_handle_touch(void *priv)
+mtouch_handle_touch(mouse_microtouch_t *dev)
 {
-    mouse_microtouch_t *dev = (mouse_microtouch_t *) priv;
-
     uint8_t touch_state;
 
     /* Touch state */
