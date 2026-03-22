@@ -182,86 +182,12 @@ mtouch_calibrate(mouse_microtouch_t *dev)
     }
 }
 
-/* Transmit Format Tablet packet */
-static void
-mtouch_transmit_tablet(mouse_microtouch_t *dev, uint8_t touch_state)
-{
-    uint8_t  status;
-    uint16_t tx, ty;
-    double   x, y;
-
-    /* CONT only reports in Stream, LIFTOFF not in Point, NONE never */
-    if ((touch_state == TOUCH_CONT && dev->mode != MODE_STREAM) ||
-        (touch_state == TOUCH_LIFTOFF && dev->mode == MODE_POINT) ||
-        (touch_state == TOUCH_NONE))
-        return;
-    
-    if (touch_state == TOUCH_LIFTOFF) {
-        x = dev->abs_x_old;
-        y = dev->abs_y_old;
-    } else {
-        x = dev->abs_x;
-        y = dev->abs_y;
-    }
-
-    /* Bit 7 always set, bit 6 = touching, bit 5 = pen, bits 0-1 = buttons */
-    status = 0x80 | ((touch_state != TOUCH_LIFTOFF) ? 0x40 : 0x00);
-    if (dev->pen_mode == 2)
-        status |= 0x20 | ((touch_state != TOUCH_LIFTOFF) ? (dev->but & 3) : 0);
-
-    tx = (uint16_t)(16383.0 * x);
-    ty = (uint16_t)(16383.0 * (1.0 - y));
-
-    fifo8_push(&dev->resp, status);
-    fifo8_push(&dev->resp, tx & 0x7F);
-    fifo8_push(&dev->resp, (tx >> 7) & 0x7F);
-    fifo8_push(&dev->resp, ty & 0x7F);
-    fifo8_push(&dev->resp, (ty >> 7) & 0x7F);
-}
-
-/* Transmit Format Decimal or Format Hexadecimal packet */
-static void
-mtouch_transmit_dec_hex(mouse_microtouch_t *dev, uint8_t touch_state)
-{
-    char        buffer[16];
-    const char  *fmt = (dev->format == FORMAT_DEC) ? "%03d,%03d\r" : "%03X,%03X\r";
-    uint16_t    c_max = (dev->format == FORMAT_DEC) ? 999 : 1023;
-    uint8_t     status;
-    double      x, y;
-
-    /* CONT only reports in Stream, LIFTOFF not in Point, NONE never */
-    if ((touch_state == TOUCH_CONT && dev->mode != MODE_STREAM) ||
-        (touch_state == TOUCH_LIFTOFF && dev->mode == MODE_POINT) ||
-        (touch_state == TOUCH_NONE))
-        return;
-
-    if (touch_state == TOUCH_LIFTOFF) {
-        x = dev->abs_x_old;
-        y = dev->abs_y_old;
-    } else {
-        x = dev->abs_x;
-        y = dev->abs_y;
-    }
-
-    if (!dev->mode_status)
-        status = 0x01;
-    else if (touch_state == TOUCH_DOWN)
-        status = 0x19;
-    else if (touch_state == TOUCH_CONT)
-        status = 0x1c;
-    else
-        status = 0x18;
-
-    fifo8_push(&dev->resp, status);
-    snprintf(buffer, sizeof(buffer), fmt, (uint16_t)(c_max * x), (uint16_t)(c_max * (1.0 - y)));
-    fifo8_push_all(&dev->resp, (uint8_t *) buffer, strlen(buffer));
-}
-
 /* Determine touch state and drive transmissions */
-static int
+static void
 mtouch_handle_touch(mouse_microtouch_t *dev)
 {
-    uint8_t touch_state;
+    uint8_t  touch_state;
+    double   x, y;
 
     /* Touch state */
     if (dev->but && !dev->but_old)
@@ -274,24 +200,73 @@ mtouch_handle_touch(mouse_microtouch_t *dev)
         touch_state = TOUCH_NONE;
 
     if (dev->mode == MODE_INACTIVE)
-        return 0;
+        return;
 
     /* Calibration or no buttonpress */
     if (dev->cal_cntr || touch_state == TOUCH_NONE) {
         if (touch_state == TOUCH_LIFTOFF)
             mtouch_calibrate(dev);
         dev->but_old = dev->but; /* Save buttonpress */
-        return 0;
+        return;
+    }
+
+    /* CONT only reports in Stream, LIFTOFF not in Point */
+    if ((touch_state == TOUCH_CONT && dev->mode != MODE_STREAM) ||
+        (touch_state == TOUCH_LIFTOFF && dev->mode == MODE_POINT)) {
+        dev->but_old = dev->but;
+        return;
+    }
+
+    /* Use old coordinates on liftoff */
+    if (touch_state == TOUCH_LIFTOFF) {
+        x = dev->abs_x_old;
+        y = dev->abs_y_old;
+    } else {
+        x = dev->abs_x;
+        y = dev->abs_y;
     }
 
     /* Transmission handlers */
     switch (dev->format) {
-        case FORMAT_TABLET:
-            mtouch_transmit_tablet(dev, touch_state);
+        case FORMAT_TABLET: {
+            uint8_t  status;
+            uint16_t tx, ty;
+
+            /* Bit 7 always set, bit 6 = touching, bit 5 = pen, bits 0-1 = buttons */
+            status = 0x80 | ((touch_state != TOUCH_LIFTOFF) ? 0x40 : 0x00);
+            if (dev->pen_mode == 2)
+                status |= 0x20 | ((touch_state != TOUCH_LIFTOFF) ? (dev->but & 3) : 0);
+
+            tx = (uint16_t)(16383.0 * x);
+            ty = (uint16_t)(16383.0 * (1.0 - y));
+
+            fifo8_push(&dev->resp, status);
+            fifo8_push(&dev->resp, tx & 0x7F);
+            fifo8_push(&dev->resp, (tx >> 7) & 0x7F);
+            fifo8_push(&dev->resp, ty & 0x7F);
+            fifo8_push(&dev->resp, (ty >> 7) & 0x7F);
             break;
-        case FORMAT_DEC: case FORMAT_HEX:
-            mtouch_transmit_dec_hex(dev, touch_state);
+        }
+        case FORMAT_DEC: case FORMAT_HEX: {
+            char        buffer[16];
+            const char *fmt   = (dev->format == FORMAT_DEC) ? "%03d,%03d\r" : "%03X,%03X\r";
+            uint16_t    c_max = (dev->format == FORMAT_DEC) ? 999 : 1023;
+            uint8_t     status;
+
+            if (!dev->mode_status)
+                status = 0x01;
+            else if (touch_state == TOUCH_DOWN)
+                status = 0x19;
+            else if (touch_state == TOUCH_CONT)
+                status = 0x1c;
+            else
+                status = 0x18;
+
+            fifo8_push(&dev->resp, status);
+            snprintf(buffer, sizeof(buffer), fmt, (uint16_t)(c_max * x), (uint16_t)(c_max * (1.0 - y)));
+            fifo8_push_all(&dev->resp, (uint8_t *) buffer, strlen(buffer));
             break;
+        }
         case FORMAT_BIN: case FORMAT_BIN_STREAM: case FORMAT_RAW: case FORMAT_ZONE:
             pclog("MT: unsupported format %d\n", dev->format);
             break;
@@ -303,7 +278,6 @@ mtouch_handle_touch(mouse_microtouch_t *dev)
     dev->abs_x_old = dev->abs_x;
     dev->abs_y_old = dev->abs_y;
     dev->but_old = dev->but;
-    return 0;
 }
 
 /* Parse and execute firmware command */
