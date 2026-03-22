@@ -21,7 +21,7 @@
     - Add additional SMT2/3 formats as we currently only support Tablet, Hex and Dec.
     - Add Mode Polled.
     - Add UV/NM commands.
-    - Add Calibrate Raw.
+    - Calibrate Raw sign bit is always 0 (emulated sensor has no negative range).
 */
 #include <stdint.h>
 #include <stdlib.h>
@@ -71,6 +71,7 @@ enum mtouch_cal_types {
     CAL_NEW         = 1,
     CAL_EXTENDED    = 2,
     CAL_INTERACTIVE = 3,
+    CAL_RAW         = 4,
 };
 
 enum mtouch_cal_points {
@@ -224,8 +225,10 @@ mtouch_calibrate(mouse_microtouch_t *dev)
 static void
 mtouch_handle_touch(mouse_microtouch_t *dev)
 {
-    uint8_t  touch_state;
-    double   x, y;
+    uint8_t touch_state;
+    uint8_t tab_status;
+    double  x, y;
+    bool    touching;
 
     if (dev->but && !dev->but_old)
         touch_state = TOUCH_DOWN;
@@ -235,6 +238,41 @@ mtouch_handle_touch(mouse_microtouch_t *dev)
         touch_state = TOUCH_LIFTOFF;
     else
         touch_state = TOUCH_NONE;
+
+    touching = (touch_state != TOUCH_LIFTOFF && touch_state != TOUCH_NONE);
+
+    /* Use last-known position on liftoff, current position otherwise */
+    if (touch_state == TOUCH_LIFTOFF) {
+        x = dev->abs_x_old;
+        y = dev->abs_y_old;
+    } else {
+        x = dev->abs_x;
+        y = dev->abs_y;
+    }
+
+    /* Tablet-style status: bit7=sync, bit6=proximity, bit5=pen, bits1-0=switches */
+    tab_status = 0x80 | (touching ? 0x40 : 0x00);
+    if (dev->pen_mode == 2)
+        tab_status |= 0x20 | (touching ? (dev->but & 3) : 0);
+
+    /* Calibrate Raw — stream 5-byte signed packets (Table 8) */
+    if (dev->cal_type == CAL_RAW) {
+        if (touch_state != TOUCH_NONE) {
+            uint16_t rx = (uint16_t)(1023.0 * x);
+            uint16_t ry     = (uint16_t)(1023.0 * y);
+
+            fifo8_push(&dev->resp, tab_status);
+            fifo8_push(&dev->resp, (rx & 0x0F) << 3);
+            fifo8_push(&dev->resp, (rx >> 4) & 0x3F);
+            fifo8_push(&dev->resp, (ry & 0x0F) << 3);
+            fifo8_push(&dev->resp, (ry >> 4) & 0x3F);
+
+            dev->abs_x_old = dev->abs_x;
+            dev->abs_y_old = dev->abs_y;
+        }
+        dev->but_old = dev->but;
+        return;
+    }
 
     if (dev->mode == MODE_INACTIVE)
         return;
@@ -259,28 +297,12 @@ mtouch_handle_touch(mouse_microtouch_t *dev)
         return;
     }
 
-    if (touch_state == TOUCH_LIFTOFF) {
-        x = dev->abs_x_old;
-        y = dev->abs_y_old;
-    } else {
-        x = dev->abs_x;
-        y = dev->abs_y;
-    }
-
     switch (dev->format) {
         case FORMAT_TABLET: {
-            uint8_t  status;
-            uint16_t tx, ty;
+            uint16_t tx = (uint16_t)(16383.0 * x);
+            uint16_t ty = (uint16_t)(16383.0 * (1.0 - y));
 
-            /* bit 7 = sync, bit 6 = touching, bit 5 = pen, bits 0-1 = buttons */
-            status = 0x80 | ((touch_state != TOUCH_LIFTOFF) ? 0x40 : 0x00);
-            if (dev->pen_mode == 2)
-                status |= 0x20 | ((touch_state != TOUCH_LIFTOFF) ? (dev->but & 3) : 0);
-
-            tx = (uint16_t)(16383.0 * x);
-            ty = (uint16_t)(16383.0 * (1.0 - y));
-
-            fifo8_push(&dev->resp, status);
+            fifo8_push(&dev->resp, tab_status);
             fifo8_push(&dev->resp, tx & 0x7F);
             fifo8_push(&dev->resp, (tx >> 7) & 0x7F);
             fifo8_push(&dev->resp, ty & 0x7F);
@@ -341,13 +363,13 @@ mtouch_process_command(mouse_microtouch_t *dev)
             dev->cal_type = CAL_EXTENDED;
     }
     else if (dev->cmd[0] == 'C' && dev->cmd[1] == 'R') { /* Calibrate Raw */
-        pclog("MT: Calibrate Raw not implemented\n");
+        dev->cal_type = CAL_RAW;
     }
     else if (dev->cmd[0] == 'F' && dev->cmd[1] == 'B') {
         if (dev->cmd[2] == 'S') { /* Format Binary Stream */
             dev->format = FORMAT_BIN_STREAM;
             dev->mode_status = true;
-        } else { /* Format Binary */
+        } else {                  /* Format Binary */
             dev->format = FORMAT_BIN;
             dev->mode_status = true;
         }
@@ -537,8 +559,10 @@ mtouch_poll(void *priv)
         dev->abs_y = dev->abs_y / (double) monitors[index].mon_ysize;
     }
 
-    dev->abs_x = dev->scale_x * dev->abs_x + dev->off_x;
-    dev->abs_y = dev->scale_y * dev->abs_y + dev->off_y;
+    if (dev->cal_type != CAL_RAW) {
+        dev->abs_x = dev->scale_x * dev->abs_x + dev->off_x;
+        dev->abs_y = dev->scale_y * dev->abs_y + dev->off_y;
+    }
 
     if (dev->abs_x >= 1.0) dev->abs_x = 1.0;
     if (dev->abs_y >= 1.0) dev->abs_y = 1.0;
