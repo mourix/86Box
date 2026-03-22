@@ -87,22 +87,22 @@ static const char *mtouch_identity[] = {
 };
 
 typedef struct mouse_microtouch_t {
-    char         cmd[256];
-    double       abs_x, abs_x_old, abs_y, abs_y_old;
-    float        scale_x, scale_y, off_x, off_y;
-    int          but, but_old;
-    int          baud_rate, cmd_pos;
-    uint8_t      format, mode;
-    uint8_t      id, cal_point, pen_mode;
-    uint8_t      cal_type;
-    bool         mode_status, soh;
-    bool         in_reset, reset;
-    uint8_t     *nvr;
-    char         nvr_path[64];
-    serial_t    *serial;
-    Fifo8        resp;
-    pc_timer_t   host_to_serial_timer;
-    pc_timer_t   reset_timer;
+    char       cmd[256];
+    double     abs_x, abs_x_old, abs_y, abs_y_old;
+    float      scale_x, scale_y, off_x, off_y;
+    int        but, but_old;
+    int        baud_rate, cmd_pos;
+    uint8_t    format, mode;
+    uint8_t    id, cal_point, pen_mode;
+    uint8_t    cal_type;
+    bool       mode_status, soh;
+    bool       in_reset, reset;
+    uint8_t   *nvr;
+    char       nvr_path[64];
+    serial_t  *serial;
+    Fifo8      resp;
+    pc_timer_t host_to_serial_timer;
+    pc_timer_t reset_timer;
 } mouse_microtouch_t;
 
 static mouse_microtouch_t *mtouch_inst = NULL;
@@ -116,7 +116,6 @@ mtouch_nvr_save(mouse_microtouch_t *dev)
     if (fp) {
         fwrite(dev->nvr, 1, NVR_SIZE, fp);
         fclose(fp);
-        fp = NULL;
     }
 }
 
@@ -147,13 +146,14 @@ mtouch_nvr_init(mouse_microtouch_t *dev)
 
     /* Allocate and initialize the EEPROM */
     dev->nvr = (uint8_t *) calloc(1, NVR_SIZE);
+    if (!dev->nvr)
+        fatal("mtouch_nvr_init(): Failed to allocate NVR\n");
 
     fp = nvr_fopen(dev->nvr_path, "rb");
     if (fp) {
         if (fread(dev->nvr, 1, NVR_SIZE, fp) != NVR_SIZE)
             fatal("mtouch_nvr_init(): Error reading data\n");
         fclose(fp);
-        fp = NULL;
     } else
         mtouch_nvr_write(dev, 1, 1, 0, 0);
 }
@@ -240,7 +240,7 @@ mtouch_handle_touch(mouse_microtouch_t *dev)
         return;
     }
 
-    /* Filter events ignore by mode */
+    /* Filter events ignored by mode */
     if ((touch_state == TOUCH_CONT && dev->mode != MODE_STREAM) ||
         (touch_state == TOUCH_LIFTOFF && dev->mode == MODE_POINT)) {
         dev->but_old = dev->but;
@@ -314,8 +314,8 @@ mtouch_process_command(mouse_microtouch_t *dev)
     dev->cmd[strcspn(dev->cmd, "\r")] = '\0';
     pclog("MT Command: %s\n", dev->cmd);
 
-    if (dev->cmd[0] == 'C' && (dev->cmd[1] == 'I' || dev->cmd[1] == 'N' || dev->cmd[1] == 'X')) { /* Calibrate Interactive/New/Extended */
-        dev->scale_x  = 1;
+    if (dev->cmd[0] == 'C' && (dev->cmd[1] == 'I' || dev->cmd[1] == 'N' || dev->cmd[1] == 'X')) {
+        dev->scale_x  = 1; /* Calibrate Interactive/New/Extended */
         dev->scale_y  = 1;
         dev->off_x    = 0;
         dev->off_y    = 0;
@@ -327,6 +327,9 @@ mtouch_process_command(mouse_microtouch_t *dev)
             dev->cal_type = CAL_NEW;
         else
             dev->cal_type = CAL_EXTENDED;
+    }
+    else if (dev->cmd[0] == 'C' && dev->cmd[1] == 'R') { /* Calibrate Raw */
+        pclog("MT: Calibrate Raw not implemented\n");
     }
     else if (dev->cmd[0] == 'F' && dev->cmd[1] == 'B') {
         if (dev->cmd[2] == 'S') { /* Format Binary Stream */
