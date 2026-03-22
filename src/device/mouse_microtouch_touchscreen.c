@@ -604,7 +604,7 @@ mtouch_close(void *priv)
 
     fifo8_destroy(&dev->resp);
     /* Detach serial port from the mouse */
-    if (dev && dev->serial && dev->serial->sd) {
+    if (dev->serial && dev->serial->sd) {
         memset(dev->serial->sd, 0, sizeof(serial_device_t));
     }
 
