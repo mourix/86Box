@@ -189,28 +189,35 @@ mtouch_calibrate(mouse_microtouch_t *dev)
 
     if (dev->cal_point == CAL_PT_DONE) {
         double inset = (dev->cal_type == CAL_EXTENDED) ? 0.125 : 0.0;
+        double ll_x, ll_y, ur_x, ur_y;
 
         /* CI auto-swaps if the points were touched in reverse order */
         if (dev->cal_type == CAL_INTERACTIVE &&
             (dev->abs_x_old > dev->abs_x || dev->abs_y_old < dev->abs_y)) {
-            double tmp;
-            tmp = dev->abs_x_old; dev->abs_x_old = dev->abs_x; dev->abs_x = tmp;
-            tmp = dev->abs_y_old; dev->abs_y_old = dev->abs_y; dev->abs_y = tmp;
+            ll_x = dev->abs_x;
+            ll_y = dev->abs_y;
+            ur_x = dev->abs_x_old;
+            ur_y = dev->abs_y_old;
+        } else {
+            ll_x = dev->abs_x_old;
+            ll_y = dev->abs_y_old;
+            ur_x = dev->abs_x;
+            ur_y = dev->abs_y;
         }
 
-        dev->scale_x  = (1.0 - 2.0 * inset) / (dev->abs_x - dev->abs_x_old);
-        dev->off_x    = inset - dev->scale_x * dev->abs_x_old;
-        dev->scale_y  = (2.0 * inset - 1.0) / (dev->abs_y - dev->abs_y_old);
-        dev->off_y    = (1.0 - inset) - dev->scale_y * dev->abs_y_old;
+        dev->scale_x  = (1.0 - 2.0 * inset) / (ur_x - ll_x);
+        dev->off_x    = inset - dev->scale_x * ll_x;
+        dev->scale_y  = (2.0 * inset - 1.0) / (ur_y - ll_y);
+        dev->off_y    = (1.0 - inset) - dev->scale_y * ll_y;
         dev->cal_type = CAL_NONE;
 
         pclog("MT NEW CAL: scale_x=%f, scale_y=%f, off_x=%f, off_y=%f\n", dev->scale_x, dev->scale_y, dev->off_x, dev->off_y);
         mtouch_nvr_write(dev, dev->scale_x, dev->scale_y, dev->off_x, dev->off_y);
         mtouch_nvr_save(dev);
+    } else {
+        dev->abs_x_old = dev->abs_x;
+        dev->abs_y_old = dev->abs_y;
     }
-
-    dev->abs_x_old = dev->abs_x;
-    dev->abs_y_old = dev->abs_y;
 }
 
 /* Determine touch state and drive transmissions */
@@ -232,8 +239,13 @@ mtouch_handle_touch(mouse_microtouch_t *dev)
     if (dev->mode == MODE_INACTIVE)
         return;
 
-    /* Calibrate */
-    if (dev->cal_point || touch_state == TOUCH_NONE) {
+    if (touch_state == TOUCH_NONE) {
+        dev->but_old = dev->but;
+        return;
+    }
+
+    /* Calibration in progress — only act on liftoff */
+    if (dev->cal_point) {
         if (touch_state == TOUCH_LIFTOFF)
             mtouch_calibrate(dev);
         dev->but_old = dev->but;
